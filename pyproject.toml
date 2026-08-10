@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rheogp"
+version = "0.3.0"
+description = "Physics-informed sparse Gaussian processes for fractional rheology and chirp rheometry"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "Isaac Miranda-Valdez" },
+]
+keywords = ["rheology", "gaussian-process", "fractional-calculus",
+            "viscoelasticity", "chirp", "OWCh"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+  "numpy>=1.23",
+  "scipy>=1.10",
+  "torch>=2.0",
+  "gpytorch>=1.11",
+  "scikit-learn>=1.2",
+  "matplotlib>=3.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "jupyter"]
+
+[tool.setuptools.packages.find]
+include = ["rheogp*"]

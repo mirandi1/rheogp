@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+.DS_Store
+# regenerable demo outputs (large)
+demos/outputs_export/
+demos/outputs_photopolymer/
+demos/*.npz
+demos/*.pdf
+demos/*.png
+# saved fits
+*_fit/
+result.npz
+result.json
