@@ -4,7 +4,7 @@ cff-version: 1.2.0
 message: "If you use RheoGP, please cite the accompanying paper."
 title: "RheoGP: physics-informed Gaussian processes for chirp rheometry"
 type: software
-version: 0.3.0
+version: 0.1.0
 date-released: 2026-07-22
 license: MIT
 authors:
