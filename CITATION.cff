@@ -1,22 +1,21 @@
-# TODO before publishing: complete the author list, ORCIDs and the
-# journal/preprint DOI once available.
+# TODO: add the journal DOI of the single-chirp paper once available.
 cff-version: 1.2.0
 message: "If you use RheoGP, please cite the accompanying paper."
 title: "RheoGP: physics-informed Gaussian processes for chirp rheometry"
 type: software
-version: 0.1.0
-date-released: 2026-07-22
+version: 1.1.0
+date-released: 2026-10-21
 license: MIT
 authors:
   - family-names: Miranda-Valdez
     given-names: Isaac
-    affiliation: "Aalto University"
+    affiliation: "Aalto University; Deltan Labs"
 preferred-citation:
   type: article
   title: "Direct inference of viscoelastic memory from chirp rheometry via physics-informed Gaussian processes"
   authors:
     - family-names: Miranda-Valdez
       given-names: Isaac
-      affiliation: "Aalto University"
+      affiliation: "Aalto University; Deltan Labs"
   year: 2026
   # doi: 10.xxxx/xxxxx        # <- fill in when available

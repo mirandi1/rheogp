@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rheogp"
-version = "0.3.0"
+version = "1.1.0"
 description = "Physics-informed sparse Gaussian processes for fractional rheology and chirp rheometry"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
-  { name = "Isaac Miranda-Valdez" },
+  { name = "Isaac Miranda-Valdez", email = "isaac@deltanlabs.com" },
 ]
 keywords = ["rheology", "gaussian-process", "fractional-calculus",
             "viscoelasticity", "chirp", "OWCh"]
@@ -30,6 +30,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "jupyter"]
+# Only `demos/mastercurve_compare.py` needs these, and only its compute
+# half: the cross-check of a rheogp master curve against the one the
+# `mastercurves` package builds from the same spectra, with `pyRheo`
+# fitting each. The plotting half is numpy/json only.
+compare = ["mastercurves", "pyRheo"]
 
 [tool.setuptools.packages.find]
 include = ["rheogp*"]

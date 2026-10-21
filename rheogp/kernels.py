@@ -53,6 +53,8 @@ Nomenclature
   (1/𝕍, 1/G, 1/η, ...); moduli are reported in derived parameters.
 """
 
+import re
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -81,6 +83,10 @@ __all__ = [
     "FractionalMaxwellGelKernel", "FractionalMaxwellLiquidKernel",
     "FractionalMaxwellKernel",
     "FKVSKernel", "FKVDKernel", "FractionalKelvinVoigtKernel",
+    "ZenerKernel", "FractionalZenerSolidSKernel",
+    "FractionalZenerLiquidSKernel", "FractionalZenerLiquidDKernel",
+    "FractionalZenerSKernel", "FractionalZenerKernel",
+    "GeneralizedMaxwellKernel",
 ]
 
 # ================================================================
@@ -158,6 +164,18 @@ def _raw_to_softplus(value: float) -> float:
     return float(np.log(np.exp(value) - 1.0))
 
 
+def _no_stress_control(name, extra=""):
+    """Raise a clear, consistent error for the Zener-family models,
+    whose stress-controlled (creep) representation is not yet
+    implemented -- see the 'Fractional Zener family' section below."""
+    raise NotImplementedError(
+        f"control='stress' (creep) is not yet implemented for "
+        f"'{name}'. {extra}Use control='strain' (the default) for "
+        "relaxation / SAOS / chirp fitting. Contributions deriving "
+        "features_stress() from the closed-form creep law are "
+        "welcome -- see CHANGELOG.md.")
+
+
 # ================================================================
 # Base class
 # ================================================================
@@ -200,6 +218,21 @@ class _BaseKernel(torch.nn.Module):
     @property
     def n_features(self):
         return len(self.prefactor_names())
+
+    def _strain_shift_exponents(self):
+        """Per-feature fractional order p_j, for kernels whose STRAIN
+        features are power-law / memoryless (no tau_c dependence) --
+        currently the FKV family. A pure horizontal TTS shift of a
+        power-law branch c*t^{-p} is algebraically identical to
+        rescaling that branch's prefactor by a_T**p (see CHANGELOG),
+        so `rheogp_multi.shift_kernel_class` uses this to multiply
+        feature j by a_T(record)**p_j instead of (or in addition to)
+        substituting tau_c, for records in a joint/master-curve fit.
+        Returning None (the default) means this kernel's strain
+        features already depend on tau_c directly and are shifted by
+        the existing tau_c-substitution mechanism instead.
+        """
+        return None
 
     def prefactor_names(self):
         return (self._prefactors_strain() if self.control == "strain"
@@ -412,6 +445,9 @@ class SpringpotKernel(_BaseKernel):
 
     def _features_strain(self, u, dt):
         return [self._D(u, dt, self.alpha)]
+
+    def _strain_shift_exponents(self):
+        return [self.alpha]
 
     def _features_stress(self, u, dt):
         return [self._I(u, dt, self.alpha)]
@@ -699,6 +735,12 @@ class FKVSKernel(_BaseKernel, _FKVCreepMixin):
     def _features_strain(self, u, dt):
         return [self._D(u, dt, self.alpha), u]
 
+    def _strain_shift_exponents(self):
+        # branch 1: springpot(alpha) -> shifts as a_T**alpha
+        # branch 2: plain spring (order 0) -> a_T**0 = 1, no shift
+        return [self.alpha, torch.zeros((), device=self.raw_alpha.device,
+                                        dtype=self.raw_alpha.dtype)]
+
     def _features_stress(self, u, dt):
         beta0 = torch.zeros((), device=u.device, dtype=u.dtype)
         return [self._fkv_creep_feature(u, dt, self.alpha, beta0)]
@@ -754,6 +796,12 @@ class FKVDKernel(_BaseKernel, _FKVCreepMixin):
 
     def _features_strain(self, u, dt):
         return [self._D(u, dt, self.beta), self._rate(u, dt)]
+
+    def _strain_shift_exponents(self):
+        # branch 1: springpot(beta) -> a_T**beta
+        # branch 2: plain dashpot (order 1, the alpha->1 limit) -> a_T**1
+        return [self.beta, torch.ones((), device=self.raw_beta.device,
+                                      dtype=self.raw_beta.dtype)]
 
     def _features_stress(self, u, dt):
         alpha1 = torch.ones((), device=u.device, dtype=u.dtype) * 0.9999
@@ -818,6 +866,11 @@ class FractionalKelvinVoigtKernel(_BaseKernel, _FKVCreepMixin):
     def _features_strain(self, u, dt):
         return [self._D(u, dt, self.alpha), self._D(u, dt, self.beta)]
 
+    def _strain_shift_exponents(self):
+        # branch 1: springpot(alpha) -> a_T**alpha
+        # branch 2: springpot(beta)  -> a_T**beta
+        return [self.alpha, self.beta]
+
     def _features_stress(self, u, dt):
         return [self._fkv_creep_feature(u, dt, self.alpha, self.beta)]
 
@@ -854,10 +907,784 @@ class FractionalKelvinVoigtKernel(_BaseKernel, _FKVCreepMixin):
 
 
 # ================================================================
+# Fractional Zener family
+#
+#   Every model here is ONE parallel element -- a spring, a dashpot,
+#   or a springpot -- in parallel with ONE "Maxwell arm": a classical
+#   Maxwell element, or one of FMG / FML / FMM (spring/springpot +
+#   springpot/dashpot in series).  Complex moduli of parallel branches
+#   simply ADD, G*(ω) = G*_parallel(ω) + G*_arm(ω), and so -- in
+#   strain control -- do the two convolution FEATURES, each with its
+#   own independent prefactor.  This is exactly the pattern already
+#   used by the FKV family (springpot ∥ springpot) above; the only
+#   difference is that the second branch here is a *relaxing* Maxwell
+#   arm instead of a second bare springpot.
+#
+#   _MaxwellArmMixin provides that one shared building block, used
+#   unmodified by all six models below:
+#
+#     (alpha, beta) = (1, 0)   ->  classical Maxwell arm  (Zener)
+#     (alpha, beta) = (a, 0)   ->  FMG arm   (FractionalZenerSolidS)
+#     (alpha, beta) = (~1, b)  ->  FML arm   (FractionalZener{LiquidS,LiquidD})
+#     (alpha, beta) = (a, b)   ->  FMM arm   (FractionalZenerS, FractionalZener)
+#
+#   because E_{1,1}(z) = exp(z), i.e. `_fmm_kernel` with alpha=1,
+#   beta=0 IS the classical Maxwell kernel exactly.
+#
+#   Stress control (creep) is NOT implemented for this family: unlike
+#   the FKV family (a single Mittag-Leffler creep kernel whose OWN
+#   internal timescale is learnable), a parallel spring/dashpot here
+#   changes the *decay rate itself* of the Maxwell-arm's creep response
+#   (e.g. classical Zener: J(t) = 1/G0 - G1/(G0(G0+G1))·exp(-t/τc'),
+#   τc' = τc·G0/(G0+G1)), so features_stress() needs its own dedicated
+#   derivation rather than a direct reuse of the strain-control
+#   machinery.  All six models raise NotImplementedError for
+#   control="stress" with a message pointing here; see CHANGELOG.md.
+# ================================================================
+
+class _MaxwellArmMixin:
+    """
+    Shared building block for the Fractional Zener family: one
+    convolution feature for a generalised Maxwell arm (spring/
+    springpot + springpot/dashpot in series), plus the matching
+    contribution to G*(ω).  Reused, unmodified, by every model below.
+    """
+
+    def _maxwell_arm_feature(self, u, dt, alpha, beta, tau_c):
+        a64 = _to64(alpha, u.device)
+        b64 = _to64(beta, u.device)
+        t64 = _to64(tau_c, u.device)
+        return self._conv_rate(
+            u, dt,
+            K_fn=lambda s: _fmm_kernel(s, alpha, beta, tau_c),
+            H_fn=lambda w: (1j * w * t64) ** a64
+                           / (1.0 + (1j * w * t64) ** (a64 - b64)),
+        )
+
+    @staticmethod
+    def _maxwell_arm_Gstar(omega, Gc, tau_c, alpha, beta):
+        """
+        G'(ω), G''(ω) of the generalised Maxwell arm ALONE (no
+        parallel branch added yet) -- the same formula used by
+        Maxwell / FMG / FML / FMM above, written once for general
+        (alpha, beta).  Reduces to each of their Gstar() formulas
+        exactly at (1,0) / (a,0) / (~1,b) / (a,b).
+        """
+        wtc = omega * tau_c
+        d_ab = alpha - beta
+        cos_ab = np.cos(np.pi * d_ab / 2)
+        denom = 1.0 + wtc**(2 * d_ab) + 2.0 * wtc**d_ab * cos_ab
+        Gp = Gc * (wtc**alpha * np.cos(np.pi * alpha / 2)
+                   + wtc**(2 * alpha - beta) * np.cos(np.pi * beta / 2)) / denom
+        Gdp = Gc * (wtc**alpha * np.sin(np.pi * alpha / 2)
+                    + wtc**(2 * alpha - beta) * np.sin(np.pi * beta / 2)) / denom
+        return Gp, Gdp
+
+
+# ================================================================
+# 9. Zener (standard linear solid)   spring(G0) ∥ Maxwell(Gc, τc)
+#
+#    σ + τc σ̇ = G0 γ + (G0+Gc)τc γ̇          τc = η/G1,  Gc = G1
+#    G* = G0 + Gc·iωτc/(1+iωτc)
+# ================================================================
+
+class ZenerKernel(_BaseKernel, _MaxwellArmMixin):
+
+    def __init__(self, tau_c_init=1.0):
+        super().__init__()
+        self.raw_tau_c = torch.nn.Parameter(
+            torch.tensor(_raw_to_softplus(tau_c_init)))
+
+    @property
+    def tau_c(self):
+        return F.softplus(self.raw_tau_c) + 1e-4
+
+    def _features_strain(self, u, dt):
+        one  = torch.ones((),  dtype=u.dtype, device=u.device)
+        zero = torch.zeros((), dtype=u.dtype, device=u.device)
+        x_arm = self._maxwell_arm_feature(u, dt, one, zero, self.tau_c)
+        return [x_arm, u]
+
+    def _features_stress(self, u, dt):
+        _no_stress_control("Zener")
+
+    def _prefactors_strain(self):
+        return ["Gc", "G0"]
+
+    def _prefactors_stress(self):
+        _no_stress_control("Zener")
+
+    def _phys_params(self):
+        if self.control == "stress":
+            _no_stress_control("Zener")
+        return {"tau_c": self.tau_c}
+
+    def _stress_prefactors_to_moduli(self, pf):
+        _no_stress_control("Zener")
+
+    def Gstar(self, omega, prefactors):
+        Gc, G0 = prefactors["Gc"], prefactors["G0"]
+        tc = self.tau_c.item()
+        Gp_arm, Gdp_arm = self._maxwell_arm_Gstar(omega, Gc, tc, 1.0, 0.0)
+        return G0 + Gp_arm, Gdp_arm
+
+
+# ================================================================
+# 10. Fractional Zener Solid-S      spring(G0) ∥ FMG(𝕍, α, G1)
+#     (the Maxwell arm is a Fractional Maxwell Gel: springpot + spring)
+# ================================================================
+
+class FractionalZenerSolidSKernel(_BaseKernel, _MaxwellArmMixin):
+
+    def __init__(self, alpha_init=0.5, tau_c_init=1.0):
+        super().__init__()
+        self.raw_alpha = torch.nn.Parameter(
+            torch.tensor(_raw_to_sigmoid(alpha_init)))
+        self.raw_tau_c = torch.nn.Parameter(
+            torch.tensor(_raw_to_softplus(tau_c_init)))
+
+    @property
+    def alpha(self):
+        return torch.sigmoid(self.raw_alpha)
+
+    @property
+    def tau_c(self):
+        return F.softplus(self.raw_tau_c) + 1e-4
+
+    def _features_strain(self, u, dt):
+        beta0 = torch.zeros((), dtype=u.dtype, device=u.device)
+        x_arm = self._maxwell_arm_feature(u, dt, self.alpha, beta0, self.tau_c)
+        return [x_arm, u]
+
+    def _features_stress(self, u, dt):
+        _no_stress_control("FractionalZenerSolidS")
+
+    def _prefactors_strain(self):
+        return ["Gc", "G0"]
+
+    def _prefactors_stress(self):
+        _no_stress_control("FractionalZenerSolidS")
+
+    def _phys_params(self):
+        if self.control == "stress":
+            _no_stress_control("FractionalZenerSolidS")
+        return {"alpha": self.alpha, "tau_c": self.tau_c}
+
+    def _stress_prefactors_to_moduli(self, pf):
+        _no_stress_control("FractionalZenerSolidS")
+
+    def Gstar(self, omega, prefactors):
+        Gc, G0 = prefactors["Gc"], prefactors["G0"]
+        a, tc = self.alpha.item(), self.tau_c.item()
+        Gp_arm, Gdp_arm = self._maxwell_arm_Gstar(omega, Gc, tc, a, 0.0)
+        return G0 + Gp_arm, Gdp_arm
+
+
+# ================================================================
+# 11. Fractional Zener Liquid-S     spring(G0) ∥ FML(𝔾, β, η)
+#     (the Maxwell arm is a Fractional Maxwell Liquid: springpot + dashpot)
+# ================================================================
+
+class FractionalZenerLiquidSKernel(_BaseKernel, _MaxwellArmMixin):
+
+    def __init__(self, beta_init=0.5, tau_c_init=1.0):
+        super().__init__()
+        self.raw_beta = torch.nn.Parameter(
+            torch.tensor(_raw_to_sigmoid(beta_init)))
+        self.raw_tau_c = torch.nn.Parameter(
+            torch.tensor(_raw_to_softplus(tau_c_init)))
+
+    @property
+    def beta(self):
+        return torch.sigmoid(self.raw_beta)
+
+    @property
+    def tau_c(self):
+        return F.softplus(self.raw_tau_c) + 1e-4
+
+    def _features_strain(self, u, dt):
+        alpha1 = torch.ones((), dtype=u.dtype, device=u.device) * 0.9999
+        x_arm = self._maxwell_arm_feature(u, dt, alpha1, self.beta, self.tau_c)
+        return [x_arm, u]
+
+    def _features_stress(self, u, dt):
+        _no_stress_control("FractionalZenerLiquidS")
+
+    def _prefactors_strain(self):
+        return ["Gc", "G0"]
+
+    def _prefactors_stress(self):
+        _no_stress_control("FractionalZenerLiquidS")
+
+    def _phys_params(self):
+        if self.control == "stress":
+            _no_stress_control("FractionalZenerLiquidS")
+        return {"beta": self.beta, "tau_c": self.tau_c}
+
+    def _stress_prefactors_to_moduli(self, pf):
+        _no_stress_control("FractionalZenerLiquidS")
+
+    def Gstar(self, omega, prefactors):
+        Gc, G0 = prefactors["Gc"], prefactors["G0"]
+        b, tc = self.beta.item(), self.tau_c.item()
+        Gp_arm, Gdp_arm = self._maxwell_arm_Gstar(omega, Gc, tc, 1.0, b)
+        return G0 + Gp_arm, Gdp_arm
+
+
+# ================================================================
+# 12. Fractional Zener Liquid-D     dashpot(η_p) ∥ FML(𝔾, β, η_s)
+#     (a parallel dashpot instead of a spring -> terminal liquid)
+# ================================================================
+
+class FractionalZenerLiquidDKernel(_BaseKernel, _MaxwellArmMixin):
+
+    def __init__(self, beta_init=0.5, tau_c_init=1.0):
+        super().__init__()
+        self.raw_beta = torch.nn.Parameter(
+            torch.tensor(_raw_to_sigmoid(beta_init)))
+        self.raw_tau_c = torch.nn.Parameter(
+            torch.tensor(_raw_to_softplus(tau_c_init)))
+
+    @property
+    def beta(self):
+        return torch.sigmoid(self.raw_beta)
+
+    @property
+    def tau_c(self):
+        return F.softplus(self.raw_tau_c) + 1e-4
+
+    def _features_strain(self, u, dt):
+        alpha1 = torch.ones((), dtype=u.dtype, device=u.device) * 0.9999
+        x_arm = self._maxwell_arm_feature(u, dt, alpha1, self.beta, self.tau_c)
+        return [x_arm, self._rate(u, dt)]
+
+    def _features_stress(self, u, dt):
+        _no_stress_control("FractionalZenerLiquidD")
+
+    def _strain_shift_exponents(self):
+        # feature 0: Maxwell arm, shifted through tau_c      -> a_T**0
+        # feature 1: plain dashpot eta_p * du/dt, transfer i w, which
+        #            under w -> a_T w scales as a_T**1
+        zero = torch.zeros((), dtype=self.raw_tau_c.dtype,
+                           device=self.raw_tau_c.device)
+        return [zero, zero + 1.0]
+
+    def _prefactors_strain(self):
+        return ["Gc", "eta_p"]
+
+    def _prefactors_stress(self):
+        _no_stress_control("FractionalZenerLiquidD")
+
+    def _phys_params(self):
+        if self.control == "stress":
+            _no_stress_control("FractionalZenerLiquidD")
+        return {"beta": self.beta, "tau_c": self.tau_c}
+
+    def _stress_prefactors_to_moduli(self, pf):
+        _no_stress_control("FractionalZenerLiquidD")
+
+    def Gstar(self, omega, prefactors):
+        Gc, eta_p = prefactors["Gc"], prefactors["eta_p"]
+        b, tc = self.beta.item(), self.tau_c.item()
+        Gp_arm, Gdp_arm = self._maxwell_arm_Gstar(omega, Gc, tc, 1.0, b)
+        return Gp_arm, eta_p * omega + Gdp_arm
+
+
+# ================================================================
+# 13. Fractional Zener-S     spring(G0) ∥ FMM(𝕍, α, 𝔾, β)
+#     (the Maxwell arm is a full Fractional Maxwell: two springpots)
+# ================================================================
+
+class FractionalZenerSKernel(_BaseKernel, _MaxwellArmMixin):
+
+    def __init__(self, alpha_init=0.7, beta_init=0.3, tau_c_init=1.0):
+        super().__init__()
+        self.raw_alpha = torch.nn.Parameter(
+            torch.tensor(_raw_to_sigmoid(alpha_init)))
+        gap0 = beta_init / max(alpha_init, 1e-3)
+        self.raw_gap = torch.nn.Parameter(
+            torch.tensor(_raw_to_sigmoid(gap0)))
+        self.raw_tau_c = torch.nn.Parameter(
+            torch.tensor(_raw_to_softplus(tau_c_init)))
+
+    @property
+    def alpha(self):
+        return torch.sigmoid(self.raw_alpha)
+
+    @property
+    def beta(self):
+        return self.alpha * torch.sigmoid(self.raw_gap)
+
+    @property
+    def tau_c(self):
+        return F.softplus(self.raw_tau_c) + 1e-4
+
+    def _features_strain(self, u, dt):
+        x_arm = self._maxwell_arm_feature(u, dt, self.alpha, self.beta,
+                                          self.tau_c)
+        return [x_arm, u]
+
+    def _features_stress(self, u, dt):
+        _no_stress_control("FractionalZenerS")
+
+    def _prefactors_strain(self):
+        return ["Gc", "G0"]
+
+    def _prefactors_stress(self):
+        _no_stress_control("FractionalZenerS")
+
+    def _phys_params(self):
+        if self.control == "stress":
+            _no_stress_control("FractionalZenerS")
+        return {"alpha": self.alpha, "beta": self.beta, "tau_c": self.tau_c}
+
+    def _stress_prefactors_to_moduli(self, pf):
+        _no_stress_control("FractionalZenerS")
+
+    def Gstar(self, omega, prefactors):
+        Gc, G0 = prefactors["Gc"], prefactors["G0"]
+        a, b, tc = self.alpha.item(), self.beta.item(), self.tau_c.item()
+        Gp_arm, Gdp_arm = self._maxwell_arm_Gstar(omega, Gc, tc, a, b)
+        return G0 + Gp_arm, Gdp_arm
+
+
+# ================================================================
+# 14. Fractional Zener (general)     springpot(𝕂, κ) ∥ FMM(𝕍, α, 𝔾, β)
+#     The most general model in the family; Zener, FKV-type parallels,
+#     FMG, FML and FMM all arise as special/limiting cases.
+# ================================================================
+
+class FractionalZenerKernel(_BaseKernel, _MaxwellArmMixin):
+    """Three springpots: a fractional Maxwell arm -- springpot(alpha) in
+    series with springpot(beta) -- in parallel with springpot(kappa).
+
+        G*(w) = K (i w)^kappa
+                + Gc (i w tau_c)^alpha / [1 + (i w tau_c)^(alpha-beta)]
+
+    Any of the three exponents can be HELD FIXED instead of fitted, via
+    `fix_alpha` / `fix_beta` / `fix_kappa`. A fixed exponent is stored as
+    a buffer, never sees a gradient, is excluded from `_phys_params()` so
+    it does not count towards k in AIC/BIC, and is reported separately by
+    `fixed_phys_params()`. Passing None (the default) leaves that
+    exponent free, which reproduces the original behaviour exactly.
+
+    Fixing exponents is what makes this one kernel cover the whole
+    family, including the degenerate members that the free
+    parameterisation can only approach asymptotically:
+
+        fix_kappa=0    parallel branch is a SPRING        -> FZS
+        fix_kappa=1    parallel branch is a DASHPOT       -> FZLD
+        fix_beta=0     arm is springpot + spring          -> FZSS-like
+        fix_alpha=1    arm is dashpot + springpot         -> FZLS-like
+        fix_beta=0, fix_kappa=0                           -> Zener-like
+
+    The sigmoid parameterisation cannot reach 0 or 1, so those limits are
+    only available by fixing. That matters for model selection: a fitted
+    exponent pinned against a boundary is not evidence that the boundary
+    is right, whereas fixing it makes the restricted model an explicit
+    candidate with one fewer parameter.
+
+    The ordering constraint beta <= alpha of the Maxwell arm is preserved
+    in every combination; see `_ORDER` note in __init__.
+    """
+
+    def __init__(self, alpha_init=0.7, beta_init=0.3, kappa_init=0.1,
+                 tau_c_init=1.0, fix_alpha=None, fix_beta=None,
+                 fix_kappa=None):
+        super().__init__()
+
+        def _chk(v, name):
+            if v is None:
+                return None
+            v = float(v)
+            if not (0.0 <= v <= 1.0):
+                raise ValueError(
+                    f"{name} must lie in [0, 1] (got {v}); it is the order "
+                    "of a springpot, 0 = spring, 1 = dashpot.")
+            return v
+
+        fa, fb, fk = (_chk(fix_alpha, "fix_alpha"), _chk(fix_beta, "fix_beta"),
+                      _chk(fix_kappa, "fix_kappa"))
+        if fa is not None and fb is not None and fb > fa:
+            raise ValueError(
+                f"fix_beta ({fb}) must not exceed fix_alpha ({fa}): the "
+                "Maxwell arm requires beta <= alpha.")
+        self.fix_alpha, self.fix_beta, self.fix_kappa = fa, fb, fk
+
+        # -- alpha / beta ------------------------------------------------
+        # beta <= alpha has to hold however many of the two are fixed, so
+        # the free one is parameterised against the other:
+        #   both free      alpha = sig(a),  beta = alpha * sig(g)
+        #   alpha fixed    beta  = alpha_fix * sig(g)
+        #   beta fixed     alpha = beta_fix + (1 - beta_fix) * sig(a)
+        #   both fixed     nothing to parameterise
+        if fa is None:
+            lo = fb if fb is not None else 0.0
+            init = max(min(float(alpha_init), 1.0 - 1e-6), lo + 1e-6)
+            self.raw_alpha = torch.nn.Parameter(
+                torch.tensor(_raw_to_sigmoid((init - lo) / max(1.0 - lo, 1e-6))))
+        else:
+            self.register_buffer("_alpha_fixed", torch.tensor(fa))
+        if fb is None:
+            a_ref = fa if fa is not None else float(alpha_init)
+            gap0 = float(beta_init) / max(a_ref, 1e-3)
+            self.raw_gap = torch.nn.Parameter(
+                torch.tensor(_raw_to_sigmoid(min(max(gap0, 1e-6), 1 - 1e-6))))
+        else:
+            self.register_buffer("_beta_fixed", torch.tensor(fb))
+
+        # -- kappa -------------------------------------------------------
+        if fk is None:
+            self.raw_kappa = torch.nn.Parameter(
+                torch.tensor(_raw_to_sigmoid(kappa_init)))
+        else:
+            self.register_buffer("_kappa_fixed", torch.tensor(fk))
+
+        self.raw_tau_c = torch.nn.Parameter(
+            torch.tensor(_raw_to_softplus(tau_c_init)))
+
+    @property
+    def alpha(self):
+        if self.fix_alpha is not None:
+            return self._alpha_fixed
+        lo = self.fix_beta if self.fix_beta is not None else 0.0
+        return lo + (1.0 - lo) * torch.sigmoid(self.raw_alpha)
+
+    @property
+    def beta(self):
+        if self.fix_beta is not None:
+            return self._beta_fixed
+        return self.alpha * torch.sigmoid(self.raw_gap)
+
+    @property
+    def kappa(self):
+        if self.fix_kappa is not None:
+            return self._kappa_fixed
+        return torch.sigmoid(self.raw_kappa)
+
+    @property
+    def tau_c(self):
+        return F.softplus(self.raw_tau_c) + 1e-4
+
+    def _features_strain(self, u, dt):
+        x_arm = self._maxwell_arm_feature(u, dt, self.alpha, self.beta,
+                                          self.tau_c)
+        x_kappa = self._D(u, dt, self.kappa)
+        return [x_arm, x_kappa]
+
+    def _features_stress(self, u, dt):
+        _no_stress_control("FractionalZener")
+
+    def _prefactors_strain(self):
+        return ["Gc", "K"]
+
+    def _prefactors_stress(self):
+        _no_stress_control("FractionalZener")
+
+    def _phys_params(self):
+        if self.control == "stress":
+            _no_stress_control("FractionalZener")
+        # a FIXED exponent is not a fitted parameter: it must not be
+        # counted in k, or a restricted model would be penalised for a
+        # number it never learned
+        p = {}
+        if self.fix_alpha is None:
+            p["alpha"] = self.alpha
+        if self.fix_beta is None:
+            p["beta"] = self.beta
+        if self.fix_kappa is None:
+            p["kappa"] = self.kappa
+        p["tau_c"] = self.tau_c
+        return p
+
+    def fixed_phys_params(self):
+        """Exponents held fixed rather than fitted -- reporting only;
+        these are excluded from the parameter count."""
+        out = {}
+        for name in ("alpha", "beta", "kappa"):
+            v = getattr(self, f"fix_{name}")
+            if v is not None:
+                out[name] = float(v)
+        return out
+
+    def _strain_shift_exponents(self):
+        # Feature 0 is the Maxwell arm, which carries tau_c and is shifted
+        # by the tau_c substitution -> exponent 0, i.e. no extra factor.
+        # Feature 1 is a bare springpot K (i w)^kappa with NO tau_c to
+        # substitute; under w -> a_T w it shifts as
+        #     K (i a_T w)^kappa = K a_T^kappa (i w)^kappa,
+        # so its feature must be scaled by a_T**kappa. Without this the
+        # parallel branch would stay at the reference temperature while
+        # the arm shifted, which is not the TTS-shifted model at all.
+        zero = torch.zeros((), dtype=self.raw_tau_c.dtype,
+                           device=self.raw_tau_c.device)
+        return [zero, self.kappa]
+
+    def _stress_prefactors_to_moduli(self, pf):
+        _no_stress_control("FractionalZener")
+
+    def Gstar(self, omega, prefactors):
+        Gc, K = prefactors["Gc"], prefactors["K"]
+        a, b, tc = self.alpha.item(), self.beta.item(), self.tau_c.item()
+        k = self.kappa.item()
+        Gp_arm, Gdp_arm = self._maxwell_arm_Gstar(omega, Gc, tc, a, b)
+        Gp  = K * omega**k * np.cos(np.pi * k / 2) + Gp_arm
+        Gdp = K * omega**k * np.sin(np.pi * k / 2) + Gdp_arm
+        return Gp, Gdp
+
+
+# ================================================================
 # Registry
 # ================================================================
 
-KERNELS = {
+
+# ================================================================
+# 15. Generalized Maxwell / Prony series
+#
+#     G*(w) = G_e + SUM_k G_k * (i w tau_k) / (1 + i w tau_k)
+#
+#     i.e. `n_modes` Maxwell arms in parallel, optionally with an
+#     equilibrium spring G_e across them. Rationalising each arm gives
+#     the form usually written in the TTS literature,
+#
+#        G*(w) = SUM_k G_k [ (w tau_k)^2 + i w tau_k ] / (1 + (w tau_k)^2)
+#
+#     so  G' = SUM_k G_k (w tau_k)^2 / (1 + (w tau_k)^2)
+#         G'' = SUM_k G_k (w tau_k)   / (1 + (w tau_k)^2).
+#
+#     THE SPECTRUM IS ANCHORED TO ONE tau_c. The relaxation times are
+#     tau_k = tau_c * rho_k, where rho_k is a FIXED log-spaced ladder
+#     fixed at construction and never fitted; only tau_c is a trainable
+#     shape parameter. This is deliberate and has three consequences:
+#
+#       1. Time-temperature superposition works unmodified. The
+#          multi-record shift machinery substitutes tau_c -> a_T tau_c
+#          per record, which slides the WHOLE ladder rigidly. That is
+#          exactly the statement of thermorheological simplicity --
+#          one horizontal shift moves every mode by the same factor --
+#          rather than an approximation of it. Fitting n independent
+#          tau_k would break that: each mode could drift on its own and
+#          the single a_T would stop meaning anything.
+#       2. There is exactly ONE nonlinear parameter (tau_c) however
+#          many modes are used. Every modulus G_k (and G_e) enters
+#          linearly, which is the regime this library's prefactor
+#          machinery is built for -- they are recovered as linear
+#          readouts with credible intervals rather than pushed through
+#          gradient descent.
+#       3. Choosing `n_modes` and the ladder span replaces choosing
+#          each tau_k. A discrete Prony spectrum is famously
+#          ill-conditioned when modes are packed closely: neighbouring
+#          exp(-t/tau_k) features become collinear, the linear readout
+#          becomes unstable, and -- since prefactors here are
+#          unconstrained -- individual G_k can come out NEGATIVE, which
+#          is unphysical. Two modes per decade (the default) is the
+#          usual compromise. Treat negative G_k in a fit as a signal
+#          that the ladder is finer than the data can resolve, and
+#          coarsen it.
+#
+#     Only strain control is implemented: the creep compliance of a
+#     Prony series is not itself a Prony series, so `_features_stress`
+#     has no closed form of the same shape.
+# ================================================================
+
+class GeneralizedMaxwellKernel(_BaseKernel, _MaxwellArmMixin):
+    """Prony series with `n_modes` arms, optionally plus an equilibrium
+    spring. Select it with `model="prony"` and set the geometry through
+    arguments -- `n_modes`, `with_spring`, `modes_per_decade`,
+    `freeze_tau_c`. The registry also parses `prony<N>` / `prony<N>s`
+    for callers that can only pass a string; "gmm" is accepted as an
+    alias but is ambiguous in a GP library (Gaussian mixture model), so
+    prefer "prony"."""
+
+    # overridden by the classes the registry builds
+    _N_MODES = 8
+    _WITH_SPRING = False
+    _MODES_PER_DECADE = 2.0
+
+    def __init__(self, tau_c_init=1.0, n_modes=None, with_spring=None,
+                 modes_per_decade=None, freeze_tau_c=False):
+        super().__init__()
+        self.n_modes = int(n_modes if n_modes is not None else self._N_MODES)
+        self.with_spring = bool(with_spring if with_spring is not None
+                                else self._WITH_SPRING)
+        mpd = float(modes_per_decade if modes_per_decade is not None
+                    else self._MODES_PER_DECADE)
+        if self.n_modes < 1:
+            raise ValueError("n_modes must be >= 1")
+        if mpd <= 0:
+            raise ValueError("modes_per_decade must be > 0")
+        self.modes_per_decade = mpd
+        # tau_c positions the ladder. FREEZING IT removes the one
+        # degeneracy this family has: sliding the ladder and
+        # redistributing the moduli leaves G*(w) almost unchanged, so
+        # tau_c and the G_k trade off against each other and neither is
+        # individually identified. With tau_c fixed there are NO
+        # nonlinear physics parameters left -- every modulus is a linear
+        # prefactor of a known feature, so the spectrum is uniquely
+        # determined by the data. This is also what standard Prony
+        # practice does (the relaxation times are chosen, not fitted),
+        # and it costs nothing under TTS: in a joint multi-record fit
+        # the per-record a_T still slide the whole ladder freely, they
+        # are simply measured against a fixed reference ladder instead
+        # of against one that drifts with them.
+        self.freeze_tau_c = bool(freeze_tau_c)
+        _raw = torch.tensor(_raw_to_softplus(tau_c_init))
+        if self.freeze_tau_c:
+            self.register_buffer("raw_tau_c", _raw)
+        else:
+            self.raw_tau_c = torch.nn.Parameter(_raw)
+        # The fixed dimensionless ladder, centred on 1 so that tau_c is
+        # the CENTRE of the spectrum rather than one end of it -- that
+        # keeps tau_c interpretable and comparable with the single-mode
+        # models' tau_c. Registered as a buffer, not a Parameter: it
+        # moves with the module but is never trained.
+        span = (self.n_modes - 1) / mpd          # decades, end to end
+        self.register_buffer(
+            "rho", torch.logspace(-span / 2.0, span / 2.0, self.n_modes,
+                                  dtype=torch.get_default_dtype())
+            if self.n_modes > 1 else torch.ones(1))
+
+    @property
+    def tau_c(self):
+        return F.softplus(self.raw_tau_c) + 1e-4
+
+    def taus(self):
+        """The n relaxation times [s], tau_k = tau_c * rho_k."""
+        return (self.tau_c * self.rho.to(self.raw_tau_c.device))
+
+    # -- features ------------------------------------------------------
+    def _features_strain(self, u, dt):
+        one = torch.ones((), dtype=u.dtype, device=u.device)
+        zero = torch.zeros((), dtype=u.dtype, device=u.device)
+        # `self.tau_c` is read once per arm on purpose: under a joint
+        # multi-record fit the shift wrapper intercepts that property
+        # and returns a_T * tau_c for the record being built, so the
+        # whole ladder shifts together.
+        tau_c = self.tau_c
+        feats = [self._maxwell_arm_feature(u, dt, one, zero, tau_c * r)
+                 for r in self.rho.to(u.device)]
+        if self.with_spring:
+            feats.append(u)          # G_e * gamma(t)
+        return feats
+
+    def _features_stress(self, u, dt):
+        _no_stress_control(
+            "GeneralizedMaxwell",
+            "The creep compliance of a Prony series is not itself a "
+            "Prony series. ")
+
+    def _prefactors_strain(self):
+        names = [f"G{k + 1}" for k in range(self.n_modes)]
+        if self.with_spring:
+            names.append("Ge")
+        return names
+
+    def _prefactors_stress(self):
+        _no_stress_control("GeneralizedMaxwell")
+
+    def _phys_params(self):
+        if self.control == "stress":
+            _no_stress_control("GeneralizedMaxwell")
+        # tau_c only -- rho is fixed, and every G_k is a prefactor.
+        # When tau_c is frozen it is not a fitted parameter at all, so it
+        # is reported through `fixed_phys_params()` instead and must not
+        # be counted in k for AIC/BIC.
+        if self.freeze_tau_c:
+            return {}
+        return {"tau_c": self.tau_c}
+
+    def fixed_phys_params(self):
+        """Physics quantities that were HELD FIXED, not fitted -- for
+        reporting only; these are excluded from the parameter count."""
+        return {"tau_c": float(self.tau_c)} if self.freeze_tau_c else {}
+
+    def _stress_prefactors_to_moduli(self, pf):
+        _no_stress_control("GeneralizedMaxwell")
+
+    def Gstar(self, omega, prefactors):
+        tau_c = self.tau_c.item()
+        rho = self.rho.detach().cpu().numpy()
+        Gp = np.zeros_like(np.asarray(omega, dtype=float))
+        Gdp = np.zeros_like(Gp)
+        for k, r in enumerate(rho):
+            Gk = prefactors[f"G{k + 1}"]
+            p, dp = self._maxwell_arm_Gstar(omega, Gk, tau_c * float(r),
+                                            1.0, 0.0)
+            Gp = Gp + p
+            Gdp = Gdp + dp
+        if self.with_spring:
+            Gp = Gp + prefactors["Ge"]
+        return Gp, Gdp
+
+
+def _gmm_class(n_modes, with_spring, modes_per_decade=2.0):
+    """Build (and cache) a concrete GeneralizedMaxwellKernel subclass.
+
+    The model factories in `model.py` / `rheogp_multi.py` instantiate a
+    CLASS with only the shared `*_init` keywords, so the mode count and
+    the presence of the spring have to be baked into the class rather
+    than passed at call time -- that is what the registry names
+    `gmm<N>` / `gmm<N>s` select.
+    """
+    key = (int(n_modes), bool(with_spring), float(modes_per_decade))
+    cls = _GMM_CACHE.get(key)
+    if cls is None:
+        cls = type(
+            f"GeneralizedMaxwell{int(n_modes)}"
+            f"{'S' if with_spring else ''}Kernel",
+            (GeneralizedMaxwellKernel,),
+            {"_N_MODES": int(n_modes), "_WITH_SPRING": bool(with_spring),
+             "_MODES_PER_DECADE": float(modes_per_decade)})
+        _GMM_CACHE[key] = cls
+    return cls
+
+
+_GMM_CACHE = {}
+
+class _KernelRegistry(dict):
+    """The kernel table, plus parametric names for the Prony series.
+
+    The canonical name is **"prony"**. `"generalizedmaxwell"`,
+    `"maxwellwiechert"`/`"wiechert"` and `"gmm"` are accepted aliases,
+    but prefer `"prony"` in new code: inside a Gaussian-process
+    library `GMM` reads as *Gaussian mixture model* (and in
+    econometrics as *generalized method of moments*), so the
+    abbreviation is ambiguous exactly where this package lives.
+
+    The ladder geometry belongs in the arguments, not the name:
+
+        model="prony", n_modes=12, with_spring=True
+
+    A trailing mode count and an optional "s" are still parsed, for
+    callers that can only pass a string:
+
+        "prony"     ->  8 modes, no spring
+        "prony12"   -> 12 modes, no spring
+        "prony12s"  -> 12 modes, plus the equilibrium spring G_e
+
+    An explicit `n_modes`/`with_spring` argument overrides whatever the
+    name encoded.
+
+    `.get()` is what the model factories call, so the parsing lives
+    there rather than in `__missing__` (which `dict.get` never
+    triggers).
+    """
+
+    _GMM_RE = re.compile(
+        r"(?:prony|generali[sz]edmaxwell|(?:maxwell)?wiechert|gmm)"
+        r"(\d+)?(s)?\Z")
+
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        m = self._GMM_RE.match(str(key))
+        if m is not None:
+            n = int(m.group(1)) if m.group(1) else 8
+            return _gmm_class(n, m.group(2) == "s")
+        return default
+
+
+KERNELS = _KernelRegistry({
     "kernelfree": KernelFreeKernel,
     "kf":         KernelFreeKernel,
     "maxwell":                 MaxwellKernel,
@@ -874,7 +1701,30 @@ KERNELS = {
     "fkvs": FKVSKernel,
     "fkvd": FKVDKernel,
     "fkv":  FractionalKelvinVoigtKernel,
-}
+    "zener":                  ZenerKernel,
+    "fractionalzenersolids":  FractionalZenerSolidSKernel,
+    "fractionalzenerliquids": FractionalZenerLiquidSKernel,
+    "fractionalzenerliquidd": FractionalZenerLiquidDKernel,
+    "fractionalzeners":       FractionalZenerSKernel,
+    "fractionalzener":        FractionalZenerKernel,
+    "fzss": FractionalZenerSolidSKernel,
+    "fzls": FractionalZenerLiquidSKernel,
+    "fzld": FractionalZenerLiquidDKernel,
+    "fzs":  FractionalZenerSKernel,
+    "fz":   FractionalZenerKernel,
+    # Prony series / generalized Maxwell. `prony<N>` and `prony<N>s`
+    # are also accepted, as are the aliases below -- see
+    # `_KernelRegistry.get`. Prefer "prony": "gmm" collides with
+    # Gaussian mixture model, which is a real ambiguity in a GP library.
+    "prony":             _gmm_class(8, False),
+    "pronys":            _gmm_class(8, True),
+    "generalizedmaxwell":  _gmm_class(8, False),
+    "generalisedmaxwell":  _gmm_class(8, False),
+    "maxwellwiechert":   _gmm_class(8, False),
+    "wiechert":          _gmm_class(8, False),
+    "gmm":               _gmm_class(8, False),   # alias, see above
+    "gmms":              _gmm_class(8, True),    # alias, see above
+})
 
 # Back-compat map (strain-control column layout of rheogp ≤ 0.2).
 # New code should call kernel.prefactor_names() instead.
@@ -888,4 +1738,10 @@ PREFACTOR_COLS = {
     FKVSKernel:                    {"V":    0, "G":   1},
     FKVDKernel:                    {"G_bb": 0, "eta": 1},
     FractionalKelvinVoigtKernel:   {"V":    0, "G_bb": 1},
+    ZenerKernel:                   {"Gc": 0, "G0": 1},
+    FractionalZenerSolidSKernel:   {"Gc": 0, "G0": 1},
+    FractionalZenerLiquidSKernel:  {"Gc": 0, "G0": 1},
+    FractionalZenerLiquidDKernel:  {"Gc": 0, "eta_p": 1},
+    FractionalZenerSKernel:        {"Gc": 0, "G0": 1},
+    FractionalZenerKernel:         {"Gc": 0, "K": 1},
 }
