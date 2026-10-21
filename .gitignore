@@ -18,3 +18,11 @@ demos/*.png
 *_fit/
 result.npz
 result.json
+# multi-temperature paper: cluster exports and generated figures
+# (regenerate with the 01_*.ipynb notebooks; large .npz bundles)
+paper_multitemperature/*_out/
+paper_multitemperature/*_figures/
+paper_multitemperature/fmm_export/
+paper_multitemperature/*.npz
+paper_multitemperature/*.pdf
+paper_multitemperature/*.png
