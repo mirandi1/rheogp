@@ -27,7 +27,38 @@ Supported models (case-insensitive, spaces/dashes ignored)
   "FractionalMaxwellGel"/"FMG", "FractionalMaxwellLiquid"/"FML",
   "FractionalMaxwell"/"FMM",
   "FractionalKelvinVoigtS"/"FKVS", "FractionalKelvinVoigtD"/"FKVD",
-  "FractionalKelvinVoigt"/"FKV", "KernelFree"/"KF"
+  "FractionalKelvinVoigt"/"FKV", "KernelFree"/"KF",
+  "Zener", "FractionalZenerSolidS"/"FZSS",
+  "FractionalZenerLiquidS"/"FZLS", "FractionalZenerLiquidD"/"FZLD",
+  "FractionalZenerS"/"FZS", "FractionalZener"/"FZ"
+
+  The Zener family (control="strain" only -- see rheogp.kernels module
+  docstring for why creep is not yet implemented for these six).
+
+  "FractionalZener"/"FZ" is the three-springpot member: a fractional
+  Maxwell arm, springpot(alpha) in series with springpot(beta), in
+  parallel with springpot(kappa). Any of the three exponents can be HELD
+  FIXED instead of fitted:
+      model="FZ", fix_kappa=0.0    parallel branch is a spring
+      model="FZ", fix_kappa=1.0    parallel branch is a dashpot
+      model="FZ", fix_beta=0.0     arm is springpot + spring
+  A fixed exponent costs no parameter in AIC/BIC and is reported by
+  `gp_model_.phys.fixed_phys_params()`. The sigmoid parameterization
+  cannot reach 0 or 1, so those limits are reachable only by fixing.
+
+  Generalized Maxwell / Prony series (control="strain" only):
+  "Prony" -- aliases "GeneralizedMaxwell", "MaxwellWiechert"/"Wiechert"
+  and "GMM" (the last is ambiguous in a GP library, where GMM reads as
+  Gaussian mixture model; prefer "Prony"). Set the ladder through
+  arguments rather than the name:
+      model="Prony", n_modes=12, with_spring=True
+  A trailing mode count and an optional "S" are still parsed for
+  string-only callers ("Prony12", "Prony12S"); an explicit argument
+  wins over whatever the name encoded.
+  The relaxation times are a FIXED log-spaced ladder (2 modes per
+  decade) anchored to the single fitted tau_c, so one horizontal
+  TTS shift slides the whole spectrum rigidly and every modulus
+  G_k (and G_e) stays a linear prefactor.
 """
 
 import warnings
@@ -38,18 +69,29 @@ import gpytorch
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 
+from .likelihoods import build_likelihood
 from .kernels import (
     KERNELS, PREFACTOR_COLS, KernelFreeKernel,
     MaxwellKernel, SpringpotKernel,
     FractionalMaxwellGelKernel, FractionalMaxwellLiquidKernel,
     FractionalMaxwellKernel,
     FKVSKernel, FKVDKernel, FractionalKelvinVoigtKernel,
+    ZenerKernel, FractionalZenerSolidSKernel,
+    FractionalZenerLiquidSKernel, FractionalZenerLiquidDKernel,
+    FractionalZenerSKernel, FractionalZenerKernel,
 )
 from .gp import RheoGPModel
 from .results import FitResult
 from . import plots
 
 __all__ = ["SPGP", "fit"]
+
+
+# Below this fraction of positive sensitivity samples, a prefactor is
+# taken to be genuinely negative rather than sign-flipped by sampling
+# noise, and its scalar summary is reported unfiltered. At 0.5 the rule
+# is simply "report the side the posterior mass is actually on".
+_PREFACTOR_POS_MIN = 0.5
 
 
 def _normalise_key(name: str) -> str:
@@ -85,10 +127,17 @@ class SPGP:
     inducing_points, learning_rate, learning_rate_physics, n_epochs,
     patience, n_epochs_linear, patience_linear, learning_rate_linear :
         Training controls (as in v0.2).
+    patience_tol : float
+        Minimum improvement in -ELBO (vs. the best value seen so far)
+        for the `patience` counter to reset; below this, the epoch
+        counts as "no improvement". Applies to both phases (RBF and
+        linear/single-phase); there is no separate tolerance for
+        `patience_linear`.
     omega_min, omega_max, n_omega :
         Frequency grid for G*(ω) reconstruction.
-    alpha_init, beta_init, tau_c_init : float or None
-        Initial values for the shape parameters.
+    alpha_init, beta_init, kappa_init, tau_c_init : float or None
+        Initial values for the shape parameters (kappa_init only used
+        by "FractionalZener").
     num_posterior_samples : int
     seed : int
     device : str or None
@@ -107,6 +156,7 @@ class SPGP:
         learning_rate_physics = 0.005,
         n_epochs              = 10_000,
         patience              = 500,
+        patience_tol          = 1e-4,
         n_epochs_linear       = 3_000,
         patience_linear       = 200,
         learning_rate_linear  = 0.01,
@@ -115,7 +165,14 @@ class SPGP:
         n_omega               = 400,
         alpha_init            = None,
         beta_init             = None,
+        kappa_init            = None,
         tau_c_init            = None,
+                 n_modes=None, with_spring=None,
+                 modes_per_decade=None,
+                 freeze_tau_c=None,
+                 fix_alpha=None, fix_beta=None, fix_kappa=None,
+        noise_model           = "shared",
+        rel_noise_init        = 0.05,
         use_strain_rate       = True,   # KernelFree only
         num_posterior_samples = 40,
         seed                  = 42,
@@ -132,15 +189,29 @@ class SPGP:
         self.learning_rate_physics = learning_rate_physics
         self.n_epochs              = n_epochs
         self.patience              = patience
+        self.patience_tol          = patience_tol
         self.n_epochs_linear       = n_epochs_linear
         self.patience_linear       = patience_linear
         self.learning_rate_linear  = learning_rate_linear
         self.omega_min = omega_min
         self.omega_max = omega_max
         self.n_omega   = n_omega
+        self.noise_model    = noise_model
+        self.rel_noise_init = rel_noise_init
         self.alpha_init = alpha_init
         self.beta_init  = beta_init
+        self.kappa_init = kappa_init
         self.tau_c_init = tau_c_init
+        # generalized-Maxwell ladder geometry (None -> the kernel's
+        # own defaults, or whatever the registry name encoded)
+        self.n_modes = n_modes
+        self.with_spring = with_spring
+        self.modes_per_decade = modes_per_decade
+        self.freeze_tau_c = freeze_tau_c
+        # fractional-Zener exponents held fixed rather than fitted
+        self.fix_alpha = fix_alpha
+        self.fix_beta = fix_beta
+        self.fix_kappa = fix_kappa
         self.use_strain_rate       = use_strain_rate
         self.num_posterior_samples = num_posterior_samples
         self.seed    = seed
@@ -211,8 +282,11 @@ class SPGP:
             num_inducing=self.inducing_points,
             gp_kernel_name=self.kernel_name,
         ).to(self.device)
-        self.likelihood_ = gpytorch.likelihoods.GaussianLikelihood(
-                           ).to(self.device)
+        # "shared" returns a plain GaussianLikelihood, i.e. exactly what
+        # this line constructed before the option existed -- switching
+        # noise models cannot change any previously computed result.
+        self.likelihood_ = build_likelihood(
+            self.noise_model, rel_init=self.rel_noise_init).to(self.device)
 
         self._train(y_torch, self.target_)
         self.prefactors_ = self._extract_prefactors()
@@ -487,8 +561,21 @@ class SPGP:
             kwargs["alpha_init"] = self.alpha_init
         if self.beta_init is not None and "beta_init" in varnames:
             kwargs["beta_init"] = self.beta_init
+        if self.kappa_init is not None and "kappa_init" in varnames:
+            kwargs["kappa_init"] = self.kappa_init
         if self.tau_c_init is not None and "tau_c_init" in varnames:
             kwargs["tau_c_init"] = self.tau_c_init
+        # Generalized-Maxwell ladder geometry. The registry name
+        # ("gmm12s") already fixes the mode count and the spring, but
+        # passing these explicitly is what lets the RESOLUTION be chosen
+        # from the data -- n_modes = modes_per_decade * (decades the
+        # master curve actually spans) -- instead of from a name.
+        for _gmm_kw in ("n_modes", "with_spring", "modes_per_decade",
+                        "freeze_tau_c",
+                        "fix_alpha", "fix_beta", "fix_kappa"):
+            _v = getattr(self, _gmm_kw, None)
+            if _v is not None and _gmm_kw in varnames:
+                kwargs[_gmm_kw] = _v
         if cls is KernelFreeKernel:
             kwargs["use_strain_rate"] = self.use_strain_rate
         phys = cls(**kwargs)
@@ -509,7 +596,8 @@ class SPGP:
                              lr_phys=self.learning_rate_physics,
                              n_epochs=self.n_epochs,
                              patience=self.patience,
-                             phase_tag="", extra_params=None)
+                             phase_tag="", extra_params=None,
+                             tol=self.patience_tol)
 
     @staticmethod
     def _count_parameters(model, lik):
@@ -537,29 +625,54 @@ class SPGP:
                               AIC/BIC (they play the role of the
                               posterior itself in an exact GP, which
                               contributes no parameters either).
+
+        * ``n_shift``       — for `rheogp.rheogp_multi.MultiRecordSPGP`
+                              (a joint fit across M records via
+                              `shift_kernel_class`): the per-record
+                              horizontal shift factors a_T are trainable
+                              `phys.log_aT` parameters that are NOT part
+                              of `named_phys_params()` (only the shared
+                              reference-record shape parameters are), so
+                              they must be counted separately or they
+                              silently drop out of k_total. `log_aT` has
+                              M raw entries, but `aT = exp(log_aT -
+                              log_aT[i_ref])` is invariant to adding a
+                              constant to every entry, so only M-1 are
+                              identifiable; that one non-identifiable
+                              gauge direction is subtracted off. For an
+                              ordinary (single-record) kernel this is 0.
         """
         n_shape      = len(model.phys.named_phys_params())
         n_prefactors = len(model.phys.prefactor_names())
 
-        n_gp_hyper, n_variational = 0, 0
+        n_gp_hyper, n_variational, n_phys_total = 0, 0, 0
         for name, p in model.named_parameters():
             if name.startswith("variational_strategy"):
                 n_variational += p.numel()
             elif name.startswith("phys."):
-                continue                       # counted as n_shape above
+                n_phys_total += p.numel()      # raw shape params + any
+                continue                       # shift-kernel log_aT
             else:
                 n_gp_hyper += p.numel()        # mean, scales, lengthscales
         for _, p in lik.named_parameters():
             n_gp_hyper += p.numel()            # observation noise
 
+        # phys.* parameters beyond the n_shape scalars are per-record
+        # shift factors (MultiRecordSPGP only); one gauge direction
+        # (log_aT[i_ref] is not independently identifiable) is removed.
+        n_shift_raw = max(n_phys_total - n_shape, 0)
+        n_shift = max(n_shift_raw - 1, 0) if n_shift_raw > 0 else 0
+
         return dict(n_shape=n_shape,
                     n_prefactors=n_prefactors,
                     n_gp_hyper=n_gp_hyper,
                     n_variational=n_variational,
-                    k_total=n_shape + n_prefactors + n_gp_hyper)
+                    n_shift=n_shift,
+                    k_total=n_shape + n_prefactors + n_gp_hyper + n_shift)
 
     def _train_loop(self, y_tensor, target_obs, lr_gp, lr_phys,
-                    n_epochs, patience, phase_tag, extra_params):
+                    n_epochs, patience, phase_tag, extra_params,
+                    tol=1e-4):
         model, lik = self.gp_model_, self.likelihood_
         mll = gpytorch.mlls.VariationalELBO(lik, model,
                                             num_data=y_tensor.numel())
@@ -596,7 +709,7 @@ class SPGP:
                 for k, v in model.phys.named_phys_params().items():
                     param_h[k].append(v)
 
-                if lv < best_loss - 1e-4:
+                if lv < best_loss - tol:
                     best_loss, wait = lv, 0
                 else:
                     wait += 1
@@ -666,7 +779,8 @@ class SPGP:
                          lr_gp=self.learning_rate,
                          lr_phys=self.learning_rate_physics,
                          n_epochs=self.n_epochs, patience=self.patience,
-                         phase_tag=" Ph1-RBF", extra_params=None)
+                         phase_tag=" Ph1-RBF", extra_params=None,
+                         tol=self.patience_tol)
 
     def _train_phase2(self, y_tensor, target_obs):
         if self.verbose:
@@ -676,7 +790,8 @@ class SPGP:
                          lr_gp=self.learning_rate_linear, lr_phys=None,
                          n_epochs=self.n_epochs_linear,
                          patience=self.patience_linear,
-                         phase_tag=" Ph2-Linear", extra_params=trainable)
+                         phase_tag=" Ph2-Linear", extra_params=trainable,
+                         tol=self.patience_tol)
 
     # ── prefactor extraction ─────────────────────────────────────
     def _extract_prefactors(self):
@@ -717,19 +832,60 @@ class SPGP:
             lower = np.quantile(phys, 0.025, axis=0)
             upper = np.quantile(phys, 0.975, axis=0)
 
-            m = np.isfinite(phys) & (phys > 0)
-            if m.any():
-                pos = phys[m]
-                scalar_mean  = float(np.mean(pos))
-                scalar_lower = float(np.quantile(pos, 0.025))
-                scalar_upper = float(np.quantile(pos, 0.975))
+            # Scalar summary of the sensitivity samples.
+            #
+            # Historically this kept only the POSITIVE samples. That is
+            # right when the prefactor is a single modulus or viscosity
+            # that cannot physically be negative (Gc, V, eta, ...): an
+            # occasional negative sample is a sign-flip artefact of the
+            # posterior draw and discarding it cleans the estimate.
+            #
+            # It is WRONG when a prefactor can legitimately come out
+            # negative, which is the normal situation for a Prony series
+            # with more modes than the data can resolve: there the
+            # posterior genuinely prefers G_k < 0, and filtering to the
+            # positive tail either reports a confident POSITIVE value
+            # with the sign inverted, or -- when no sample is positive
+            # at all -- returns NaN and hides the diagnosis entirely.
+            #
+            # So the filter is applied only while it is still plausibly
+            # removing artefacts, i.e. while most samples are positive.
+            # Once the posterior mass sits mainly below zero the
+            # unfiltered statistics are reported instead and flagged, so
+            # a negative modulus is visible as a negative number rather
+            # than as NaN or as a sign flip. For any prefactor whose
+            # samples are overwhelmingly positive -- every prefactor of
+            # the fractional families in practice -- this is exactly the
+            # previous behaviour.
+            finite = np.isfinite(phys)
+            n_finite = int(finite.sum())
+            frac_pos = (float(np.mean(phys[finite] > 0))
+                        if n_finite else float("nan"))
+            m = finite & (phys > 0)
+            filtered = bool(m.any()) and not (frac_pos < _PREFACTOR_POS_MIN)
+            if filtered:
+                sel = phys[m]
+            elif n_finite:
+                sel = phys[finite]
+            else:
+                sel = None
+
+            if sel is not None and sel.size:
+                scalar_mean  = float(np.mean(sel))
+                scalar_lower = float(np.quantile(sel, 0.025))
+                scalar_upper = float(np.quantile(sel, 0.975))
             else:
                 scalar_mean = scalar_lower = scalar_upper = float("nan")
 
             out[name] = dict(samples=phys, mean=mean, lower=lower,
                              upper=upper, scalar_mean=scalar_mean,
                              scalar_lower=scalar_lower,
-                             scalar_upper=scalar_upper)
+                             scalar_upper=scalar_upper,
+                             # diagnostics: what fraction of the
+                             # posterior sensitivity is positive, and
+                             # whether the positive-only filter was used
+                             frac_positive=frac_pos,
+                             positive_filtered=filtered)
             if self.verbose:
                 print(f"  {name}: {scalar_mean:.6g}  "
                       f"95%CI [{scalar_lower:.6g}, {scalar_upper:.6g}]")
@@ -790,6 +946,37 @@ class SPGP:
             if np.isfinite(G_bb) and np.isfinite(eta) and G_bb > 0 \
                and (1 - b) > 0:
                 out["tau_c"] = float((eta / G_bb) ** (1.0 / (1.0 - b)))
+        # -- Zener family: "Gc" is the Maxwell-arm's own characteristic
+        #    modulus, i.e. G1 = G_infty - G0 in the paper's notation.
+        elif cls is ZenerKernel:
+            tc = p["tau_c"]; G1 = pf.get("Gc", np.nan); G0 = pf.get("G0", np.nan)
+            out.update(tau_c=tc, G1=G1, G0=G0, eta=G1 * tc,
+                       G_infty=G0 + G1)
+        elif cls is FractionalZenerSolidSKernel:
+            tc, a = p["tau_c"], p["alpha"]
+            G1, G0 = pf.get("Gc", np.nan), pf.get("G0", np.nan)
+            out.update(tau_c=tc, alpha=a, G1=G1, G0=G0,
+                       V=G1 * tc**a, G_infty=G0 + G1)
+        elif cls is FractionalZenerLiquidSKernel:
+            tc, b = p["tau_c"], p["beta"]
+            Gc, G0 = pf.get("Gc", np.nan), pf.get("G0", np.nan)
+            out.update(tau_c=tc, beta=b, G0=G0, eta=Gc * tc,
+                       G_bb=Gc * tc**b)
+        elif cls is FractionalZenerLiquidDKernel:
+            tc, b = p["tau_c"], p["beta"]
+            Gc, eta_p = pf.get("Gc", np.nan), pf.get("eta_p", np.nan)
+            out.update(tau_c=tc, beta=b, eta_p=eta_p, eta_s=Gc * tc,
+                       G_bb=Gc * tc**b)
+        elif cls is FractionalZenerSKernel:
+            tc, a, b = p["tau_c"], p["alpha"], p["beta"]
+            Gc, G0 = pf.get("Gc", np.nan), pf.get("G0", np.nan)
+            out.update(tau_c=tc, alpha=a, beta=b, G0=G0,
+                       V=Gc * tc**a, G_bb=Gc * tc**b)
+        elif cls is FractionalZenerKernel:
+            tc, a, b, kap = p["tau_c"], p["alpha"], p["beta"], p["kappa"]
+            Gc, K = pf.get("Gc", np.nan), pf.get("K", np.nan)
+            out.update(tau_c=tc, alpha=a, beta=b, kappa=kap, K=K,
+                       V=Gc * tc**a, G_bb=Gc * tc**b)
         return {k: float(v) for k, v in out.items() if np.isfinite(v)}
 
     # ── FFT reference estimate ───────────────────────────────────
